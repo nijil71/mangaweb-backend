@@ -1,10 +1,13 @@
 from flask import Flask, send_from_directory, jsonify, request,send_file
+from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import os
 import time
 from PIL import Image
 import io
+from dotenv import load_dotenv
+
 
 
 
@@ -15,14 +18,112 @@ CORS(app)
 UPLOAD_FOLDER = 'manga_images'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
+# PostgreSQL database configuration (external database URL)
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('POSTGRESQL_URI')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+db = SQLAlchemy(app)
+
+class News(db.Model):
+    __tablename__ = 'news'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.String(50), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    summary = db.Column(db.Text, nullable=False)
+    link = db.Column(db.String(200), nullable=True)
+    image = db.Column(db.String(300), nullable=True)
+
+    def __init__(self, date, title, summary, link, image):
+        self.date = date
+        self.title = title
+        self.summary = summary
+        self.link = link
+        self.image = image
+
+    def serialize(self):
+        return {
+            'id': self.id,
+            'date': self.date,
+            'title': self.title,
+            'summary': self.summary,
+            'link': self.link,
+            'image': self.image
+        }
+
+# Create the database and tables
+with app.app_context():
+    db.create_all()
 
 # Ensure the upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.route('/api/news', methods=['POST'])
+def add_news():
+    try:
+        data = request.get_json()
+        if not data or not all(key in data for key in ('date', 'title', 'summary')):
+            return jsonify({
+                'success': False,
+                'error': 'Missing required fields'
+            }), 400
+        
+        new_news = News(
+            date=data['date'],
+            title=data['title'],
+            summary=data['summary'],
+            link=data.get('link', None),  # Optional
+            image=data.get('image', None)  # Optional
+        )
+        db.session.add(new_news)
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'news': new_news.serialize()
+        }), 201
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+@app.route('/api/news', methods=['GET'])
+def get_news():
+    try:
+        news_list = News.query.all()
+        return jsonify({
+            'success': True,
+            'news': [news.serialize() for news in news_list]
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+    
+@app.route('/api/news/<int:news_id>', methods=['DELETE'])
+def delete_news(news_id):
+    try:
+        news = db.session.get(News, news_id)
+        if not news:
+            return jsonify({
+                'success': False,
+                'error': 'News not found'
+            }), 404
+        db.session.delete(news)
+        db.session.commit()
+        return jsonify({
+            'Sucess': True
+        }), 200
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 @app.route('/api/images')
 def get_images():
