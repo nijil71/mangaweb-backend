@@ -7,6 +7,8 @@ import time
 from PIL import Image
 import io
 from dotenv import load_dotenv
+import secrets
+from functools import wraps
 
 load_dotenv()
 
@@ -15,11 +17,39 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Add secret key configuration
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY')
+ADMIN_TOKEN = os.getenv('ADMIN_TOKEN')
+
+def require_token(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        
+        if not token:
+            return jsonify({
+                'success': False,
+                'error': 'No token provided'
+            }), 401
+        
+        if token.startswith('Bearer '):
+            token = token.split(' ')[1]
+        
+        # Verify token
+        if token != ADMIN_TOKEN:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid token'
+            }), 403
+            
+        return f(*args, **kwargs)
+    return decorated_function
+
 #upload folder and allowed extensions
 UPLOAD_FOLDER = 'manga_images'
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
-# PostgreSQL database configuration (external database URL)
+# PostgreSQL database configuration 
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('POSTGRESQL_URI')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -64,6 +94,7 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/api/news', methods=['POST'])
+@require_token
 def add_news():
     try:
         data = request.get_json()
@@ -77,8 +108,8 @@ def add_news():
             date=data['date'],
             title=data['title'],
             summary=data['summary'],
-            link=data.get('link', None),  # Optional
-            image=data.get('image', None)  # Optional
+            link=data.get('link', None),  
+            image=data.get('image', None)  
         )
         db.session.add(new_news)
         db.session.commit()
@@ -175,7 +206,7 @@ def upload_image():
 
         if file and allowed_file(file.filename):
             filename = secure_filename(file.filename)
-            # Add timestamp to filename to avoid duplicates
+            # Added timestamp to filename to avoid duplicates
             base, ext = os.path.splitext(filename)
             filename = f"{base}_{int(time.time())}{ext}"
             
