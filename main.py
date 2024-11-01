@@ -47,6 +47,8 @@ def require_token(f):
 
 #upload folder and allowed extensions
 UPLOAD_FOLDER = 'manga_images'
+WALLPAPER_FOLDER = 'wallpapers'
+
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
 # PostgreSQL database configuration 
@@ -89,6 +91,8 @@ with app.app_context():
 
 # Ensure the upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(WALLPAPER_FOLDER, exist_ok=True)
+
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -228,6 +232,39 @@ def upload_image():
             'success': False,
             'error': str(e)
         }), 500
+
+@app.route('/api/wallpapers', methods=['GET'])
+def get_wallpapers():
+    """Return a list of all images in the wallpapers directory"""
+    try:
+        # List only files with allowed extensions in the wallpapers folder
+        wallpapers = [f for f in os.listdir(WALLPAPER_FOLDER)
+                      if f.lower().endswith(tuple(ALLOWED_EXTENSIONS))]
+        
+        # Generate URLs for each wallpaper
+        wallpaper_urls = [f'/api/wallpapers/{wallpaper}' for wallpaper in wallpapers]
+        
+        return jsonify({
+            'success': True,
+            'wallpapers': wallpaper_urls
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/wallpapers/<path:filename>')
+def serve_wallpaper(filename):
+    """Serve an individual wallpaper file"""
+    try:
+        # Serve the specified file from the wallpapers folder
+        return send_from_directory(WALLPAPER_FOLDER, filename)
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 404
 
 @app.route('/api/images/download/<path:filename>')
 def download_image_as_jpg(filename):
