@@ -1,4 +1,4 @@
-from flask import Flask, send_from_directory, jsonify, request,send_file
+from flask import Flask, send_from_directory, jsonify, request, send_file, make_response
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -9,6 +9,9 @@ import io
 from dotenv import load_dotenv
 import secrets
 from functools import wraps
+import hashlib
+import redis
+from datetime import timedelta
 
 load_dotenv()
 
@@ -48,7 +51,7 @@ def require_token(f):
 #upload folder and allowed extensions
 UPLOAD_FOLDER = 'manga_images'
 WALLPAPER_FOLDER = 'wallpapers'
-
+CACHE_FOLDER = Path('image_cache')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
 # PostgreSQL database configuration 
@@ -92,6 +95,20 @@ with app.app_context():
 # Ensure the upload folder exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(WALLPAPER_FOLDER, exist_ok=True)
+CACHE_FOLDER.mkdir(exist_ok=True)
+redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379'))
+IMAGE_SIZES = {
+    'thumbnail': {
+        'size': (300, 400),    # For grid view
+        'quality': 60,         # Lower quality for thumbnails
+        'target_size': 50_000  # Target ~50KB for thumbnails
+    },
+    'preview': {
+        'size': (800, 1067),   # For modal view
+        'quality': 85,         # Higher quality for previews
+        'target_size': 200_000 # Target ~200KB for previews
+    }
+}
 
 
 def allowed_file(filename):
@@ -233,20 +250,73 @@ def upload_image():
             'error': str(e)
         }), 500
 
-@app.route('/api/wallpapers', methods=['GET'])
-def get_wallpapers():
-    """Return a list of all images in the wallpapers directory"""
-    try:
-        # List only files with allowed extensions in the wallpapers folder
-        wallpapers = [f for f in os.listdir(WALLPAPER_FOLDER)
-                      if f.lower().endswith(tuple(ALLOWED_EXTENSIONS))]
+@lru_cache(maxsize=100)
+def get_optimized_image(image_path, preset):
+    """Get or create optimized version of image with target file size"""
+    cache_path = CACHE_FOLDER / f"{Path(image_path).stem}_{preset}.jpg"
+    
+    # Return cached file if it exists
+    if cache_path.exists():
+        return cache_path.read_bytes()
+    
+    size_config = IMAGE_SIZES[preset]
+    quality = size_config['quality']
+    target_size = size_config['target_size']
+    
+    with Image.open(image_path) as img:
+        # Convert to RGB if necessary
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
         
-        # Generate URLs for each wallpaper
-        wallpaper_urls = [f'/api/wallpapers/{wallpaper}' for wallpaper in wallpapers]
+        # Resize image
+        img.thumbnail(size_config['size'], Image.Resampling.LANCZOS)
+        
+        # Binary search for optimal quality to meet target file size
+        min_quality = 20
+        max_quality = quality
+        best_buffer = None
+        
+        while min_quality <= max_quality:
+            current_quality = (min_quality + max_quality) // 2
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=current_quality, optimize=True)
+            
+            if buffer.tell() <= target_size:
+                best_buffer = buffer.getvalue()
+                min_quality = current_quality + 1
+            else:
+                max_quality = current_quality - 1
+        
+        # Save to cache
+        if best_buffer:
+            cache_path.write_bytes(best_buffer)
+            return best_buffer
+        
+        # Fallback if target size cannot be met
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=min_quality, optimize=True)
+        cache_path.write_bytes(buffer.getvalue())
+        return buffer.getvalue()
+
+@app.route('/api/wallpapers')
+def get_wallpapers():
+    """Return a list of all wallpapers with optimized paths"""
+    try:
+        wallpapers = [f for f in os.listdir(WALLPAPER_FOLDER)
+                     if f.lower().endswith(tuple(ALLOWED_EXTENSIONS))]
+        
+        wallpaper_data = []
+        for wallpaper in wallpapers:
+            wallpaper_data.append({
+                'id': wallpaper,
+                'thumbnail': f'/api/wallpapers/thumbnail/{wallpaper}',
+                'preview': f'/api/wallpapers/preview/{wallpaper}',
+                'download': f'/api/wallpapers/download/{wallpaper}'
+            })
         
         return jsonify({
             'success': True,
-            'wallpapers': wallpaper_urls
+            'wallpapers': wallpaper_data
         })
     except Exception as e:
         return jsonify({
@@ -254,47 +324,40 @@ def get_wallpapers():
             'error': str(e)
         }), 500
 
-@app.route('/api/wallpapers/<path:filename>')
-def serve_wallpaper(filename):
-    """Serve an individual wallpaper file"""
+@app.route('/api/wallpapers/<string:size_preset>/<path:filename>')
+def serve_wallpaper_size(size_preset, filename):
+    """Serve wallpaper in specified size with caching"""
     try:
-        # Serve the specified file from the wallpapers folder
-        return send_from_directory(WALLPAPER_FOLDER, filename)
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 404
+        if size_preset not in IMAGE_SIZES and size_preset != 'download':
+            return jsonify({'error': 'Invalid size preset'}), 400
 
-@app.route('/api/images/download/<path:filename>')
-def download_image_as_jpg(filename):
-    """Serve a .webp image as a .jpg file"""
-    webp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        image_path = os.path.join(WALLPAPER_FOLDER, filename)
+        if not os.path.exists(image_path):
+            return jsonify({'error': 'Image not found'}), 404
 
-    if not os.path.exists(webp_path):
-        return jsonify({
-            'success': False,
-            'error': 'File not found'
-        }), 404
+        # For downloads, serve original file
+        if size_preset == 'download':
+            return send_from_directory(
+                WALLPAPER_FOLDER,
+                filename,
+                as_attachment=True
+            )
 
-    try:
-        # Convert .webp to .jpg
-        img = Image.open(webp_path)
-        img_rgb = img.convert('RGB')  # Convert to RGB for JPG compatibility
+        # Get optimized image
+        image_data = get_optimized_image(image_path, size_preset)
+
+        # Serve the image with caching headers
+        response = make_response(image_data)
+        response.headers['Content-Type'] = 'image/jpeg'
+        response.headers['Cache-Control'] = 'public, max-age=31536000'  # Cache for 1 year
+        response.headers['ETag'] = f'"{hash(image_data)}"'
         
-        # Save the image in-memory as .jpg
-        img_io = io.BytesIO()
-        img_rgb.save(img_io, 'JPEG', quality=85)
-        img_io.seek(0)
+        return response
 
-        # Send the converted image as an attachment
-        return send_file(img_io, mimetype='image/jpeg', as_attachment=True, download_name=f'{os.path.splitext(filename)[0]}.jpg')
-    
     except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
-
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
