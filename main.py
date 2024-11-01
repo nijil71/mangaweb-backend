@@ -8,7 +8,7 @@ from PIL import Image
 import io
 from dotenv import load_dotenv
 import secrets
-from functools import wraps
+from functools import wraps, lru_cache
 import hashlib
 import redis
 from datetime import timedelta
